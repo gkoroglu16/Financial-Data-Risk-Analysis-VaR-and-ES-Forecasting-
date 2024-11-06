@@ -1,0 +1,141 @@
+---
+title: "Q.3_HW4_ecmt6006"
+output: pdf_document
+date: "2024-11-03"
+---
+
+```{r}
+setwd("/Users/gorkis/Desktop/ecmt6006/HW4_ecmt6006")
+library(quantmod) ## extract financial data
+library(dplyr) ## prepare/process datasets
+library(zoo) ## VaR estimation
+library(rugarch) ## garch model
+library(tidyr) ## plot data
+library(ggplot2) ## ggplot
+library(broom) ## logit regression model
+```
+
+```{r}
+# Get Apple stock returns data (2014-2024) (2489 observations)
+getSymbols("AAPL", src = "yahoo") 
+data = AAPL[, "AAPL.Adjusted"] %>% .[-(1:2000)] %>% setNames("adj.close")
+# Log return
+lret = data$adj.close %>% log() %>% diff() 
+#Final dataset -ready to use
+df = setNames(data.frame(Date = index(data[-1, ]),
+                         Adj.close = data$adj.close[-1, ],
+                         lret = lret[-1, ] * 100), 
+              c("Date", "Adj.close", "lret"))
+# Daily returns
+df$returns <- c(NA, diff(log(df$Adj.close)))  
+```
+
+(Q1.a) -- VaR - 1%, 5% , 10% 
+```{r}
+# 1%
+VaR_1_percent <- quantile(df$returns, 0.01, na.rm = TRUE)
+# 5%
+VaR_5_percent <- quantile(df$returns, 0.05, na.rm = TRUE)
+# 10%
+VaR_10_percent <- quantile(df$returns, 0.1, na.rm = TRUE)
+# Results -- (1.a)
+VaRs = c(VaR_1_percent,VaR_5_percent, VaR_10_percent)
+print(VaRs) 
+```
+
+(Q1.b) -- 1% VaR using Historical Simulation (HS) and rolling window 250 days
+```{r}
+VaR_estimates <- numeric(nrow(df) - 250 + 1)
+
+# Rolling window calculation for VaR
+for (i in 1:(nrow(df) - 250 + 1)) {
+  # Subset the returns for the current rolling window
+  window_returns <- df$returns[i:(i + 249)]
+  
+  # Calculate the 1% VaR for the current window using historical simulation
+  VaR_estimates[i] <- quantile(window_returns, 0.01, na.rm = TRUE)
+}
+
+# Create a new column in the data frame for VaR estimates
+df$VaR_HS <- c(rep(NA, 249), VaR_estimates)  # Fill in NA for the first 249
+```
+
+(Q1.c) -- 1% VaR using FHS 
+```{r}
+# Fit GARCH model into returns
+garch_spec <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+                         mean.model = list(armaOrder = c(0, 0), include.mean = TRUE))
+
+garch_fit <- ugarchfit(spec = garch_spec, data = df$returns[!is.na(df$returns)])  
+
+filtered_sd <- sigma(garch_fit)    # Extract the filtered standard deviations
+
+# Calculate the filtered returns
+residuals <- residuals(garch_fit, standardize = TRUE)  # Standardized residuals
+filtered_returns <- residuals * filtered_sd
+
+# 1% FHS VaR
+VaR_filtered_estimates <- numeric(nrow(df) - 1)  # Start with NA for the first row
+
+for (i in 1:(nrow(df) - 1)) {
+  if (i >= 250) {  # Start calculating after the first 249
+    window_returns <- filtered_returns[(i - 249):i]
+    VaR_filtered_estimates[i] <- quantile(window_returns, 0.01, na.rm = TRUE)
+  }
+}
+
+# Create a new column in the data frame for VaR_filteredHS estimates
+df$VaR_filteredHS <- NA  # Initialize with NA
+df$VaR_filteredHS[2:nrow(df)] <- VaR_filtered_estimates[2:nrow(df)] # Assign VaR estimates to the appropriate rows
+# IF 0, define as NA
+df$VaR_filteredHS[df$VaR_filteredHS == 0] <- NA
+
+# Calculate the 1% quantile of the filtered returns
+quantile_1_percent <- quantile(filtered_returns, 0.01, na.rm = TRUE)
+print(quantile_1_percent)
+```
+
+(Q1.d) -- Plot HS and FHS 1% VaR
+```{r}
+plot_data <- df %>%
+  select(Date, VaR_HS, VaR_filteredHS) %>%
+  gather(key = "VaR_Type", value = "VaR_Estimate", VaR_HS, VaR_filteredHS)
+
+# Plot the VaR estimates
+ggplot(plot_data, aes(x = Date)) +
+  geom_line(aes(y = VaR_Estimate, color = VaR_Type)) +
+  labs(title = "Estimates of 1% VaR for the Apple Returns, 2014-2024",
+       x = "Date",
+       y = "VaR Estimate",
+       color = "VaR Type") +
+  theme_minimal()
+```
+
+(Q1.e) -- Evaluating VaR forecast w/ Hit_t+1 (conditional coverage tests)
+```{r}
+# For (I) VaR_HS
+# Create Hit_t and lagged VaR for t+1
+df <- df %>%
+  mutate(
+    Hit_t_plus_1 = ifelse(returns < VaR_HS, 1, 0),             
+    Hit_t = lag(Hit_t_plus_1, order_by = Date),        
+    VaR_t_plus_1 = lead(VaR_HS, order_by = Date)       
+  )
+# run the logit regression
+model <- glm(Hit_t_plus_1 ~ Hit_t + VaR_t_plus_1, family = binomial(link = "logit"), data = df) # summary(model)
+summary(model)
+
+# For (II) VaR_filteredHS
+# Create Hit_t and lagged VaR for t+1
+df <- df %>%
+  mutate(
+    Hit_t_plus_1 = ifelse(returns < VaR_HS, 1, 0),             
+    Hit_t = lag(Hit_t_plus_1, order_by = Date),        
+    VaR_t_plus_1 = lead(VaR_filteredHS, order_by = Date)       
+  )
+# run the logit regression
+model <- glm(Hit_t_plus_1 ~ Hit_t + VaR_t_plus_1, family = binomial(link = "logit"), data = df) # summary(model)
+summary(model)
+
+```
+Result to (Q1.e) suggests that there is not enough statistical significance to reject the null hypothesis. Hence, the VaR estimates should be optimal.
